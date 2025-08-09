@@ -1,5 +1,6 @@
-// 更新日期: 2025-08-08，更新内容: 为页面函数转换为模块语法
-
+// 更新日期: 2025-08-09
+// 更新内容: 无论是否重定向，只要目标是 AWS S3，就自动补全 x-amz-content-sha256 和 x-amz-date
+// 保留原有 UI 页面和加速功能，兼容中国大陆和 IPv6-only 网络环境
 // 用户配置区域开始 =================================
 // 以下变量用于配置代理服务的白名单和安全设置，可根据需求修改。
 
@@ -222,12 +223,12 @@ const HOMEPAGE_HTML = `
     <!-- Docker 镜像加速 -->
     <div class="section-box">
       <h2 class="text-xl font-semibold mb-2">🐳 Docker 镜像加速</h2>
-      <p class="text-gray-600 dark:text-gray-300 mb-4">输入原镜像地址（如 nginx 或 ghcr.io/user/repo），获取加速拉取命令。</p>
+      <p class="text-gray-600 dark:text-gray-300 mb-4">输入原镜像地址（如 hello-world 或 ghcr.io/user/repo），获取加速拉取命令。</p>
       <div class="flex gap-2 mb-2">
         <input
           id="docker-image"
           type="text"
-          placeholder="请输入镜像地址，例如：nginx 或 ghcr.io/user/repo"
+          placeholder="请输入镜像地址，例如：hello-world 或 ghcr.io/user/repo"
           class="flex-grow p-2 border border-gray-400 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
         >
         <button
@@ -422,6 +423,28 @@ async function handleToken(realm, service, scope) {
   }
 }
 
+function isAmazonS3(url) {
+  try {
+    return new URL(url).hostname.includes('amazonaws.com');
+  } catch {
+    return false;
+  }
+}
+
+// 计算请求体的 SHA256 哈希值
+async function calculateSHA256(message) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(message);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 获取空请求体的 SHA256 哈希值
+function getEmptyBodySHA256() {
+  return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+}
+
 async function handleRequest(request, redirectCount = 0) {
   const MAX_REDIRECTS = 5; // 最大重定向次数
   const url = new URL(request.url);
@@ -467,7 +490,7 @@ async function handleRequest(request, redirectCount = 0) {
   } else {
     // 原有的处理逻辑
     if (!ALLOWED_HOSTS.includes(pathParts[0])) {
-      // Docker Hub 默认命名空间（如 nginx）
+      // Docker Hub 默认命名空间（如 hello-world）
       isDockerRequest = true;
       targetDomain = 'registry-1.docker.io';
       targetPath = `library/${pathParts.join('/')}`;
@@ -502,30 +525,27 @@ async function handleRequest(request, redirectCount = 0) {
   const targetUrl = isDockerRequest
     ? `https://${targetDomain}/${isV2Request ? 'v2/' : ''}${targetPath}`
     : `https://${targetDomain}/${targetPath}`;
-  console.log(`Target URL: ${targetUrl}`);
 
-  // 处理 /v2/ 根请求（Docker 特有）
-  if (isDockerRequest && isV2Request && targetPath === '') {
-    console.log('Handling /v2/ root request');
-    return new Response('{}', {
-      status: 200,
-      headers: { 'Docker-Distribution-API-Version': 'registry/2.0' }
-    });
-  }
-
-  // 创建请求
   const newRequestHeaders = new Headers(request.headers);
   newRequestHeaders.set('Host', targetDomain);
-  const newRequest = new Request(targetUrl, {
-    method: request.method,
-    headers: newRequestHeaders,
-    body: request.body,
-    redirect: 'follow' // 改为 follow 以支持 GitHub 反向代理
-  });
+  newRequestHeaders.delete('x-amz-content-sha256');
+  newRequestHeaders.delete('x-amz-date');
+  newRequestHeaders.delete('x-amz-security-token');
+  newRequestHeaders.delete('x-amz-user-agent');
+
+  if (isAmazonS3(targetUrl)) {
+    newRequestHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
+    newRequestHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
+  }
 
   try {
-    // 尝试直接请求
-    let response = await fetch(newRequest);
+    // 尝试直接请求（注意：使用 manual 重定向以便我们能拦截到 307 并自己请求 S3）
+    let response = await fetch(targetUrl, {
+      method: request.method,
+      headers: newRequestHeaders,
+      body: request.body,
+      redirect: 'manual'
+    });
     console.log(`Initial response: ${response.status} ${response.statusText}`);
 
     // 处理 Docker 认证挑战
@@ -542,11 +562,22 @@ async function handleRequest(request, redirectCount = 0) {
             const authHeaders = new Headers(request.headers);
             authHeaders.set('Authorization', `Bearer ${token}`);
             authHeaders.set('Host', targetDomain);
+            // 如果目标是 S3，添加必要的 x-amz 头；否则删除可能干扰的头部
+            if (isAmazonS3(targetUrl)) {
+              authHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
+              authHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
+            } else {
+              authHeaders.delete('x-amz-content-sha256');
+              authHeaders.delete('x-amz-date');
+              authHeaders.delete('x-amz-security-token');
+              authHeaders.delete('x-amz-user-agent');
+            }
+
             const authRequest = new Request(targetUrl, {
               method: request.method,
               headers: authHeaders,
               body: request.body,
-              redirect: 'follow'
+              redirect: 'manual'
             });
             console.log('Retrying with token');
             response = await fetch(authRequest);
@@ -556,11 +587,22 @@ async function handleRequest(request, redirectCount = 0) {
             const anonHeaders = new Headers(request.headers);
             anonHeaders.delete('Authorization');
             anonHeaders.set('Host', targetDomain);
+            // 如果目标是 S3，添加必要的 x-amz 头；否则删除可能干扰的头部
+            if (isAmazonS3(targetUrl)) {
+              anonHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
+              anonHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
+            } else {
+              anonHeaders.delete('x-amz-content-sha256');
+              anonHeaders.delete('x-amz-date');
+              anonHeaders.delete('x-amz-security-token');
+              anonHeaders.delete('x-amz-user-agent');
+            }
+
             const anonRequest = new Request(targetUrl, {
               method: request.method,
               headers: anonHeaders,
               body: request.body,
-              redirect: 'follow'
+              redirect: 'manual'
             });
             response = await fetch(anonRequest);
             console.log(`Anonymous response: ${response.status} ${response.statusText}`);
@@ -578,7 +620,7 @@ async function handleRequest(request, redirectCount = 0) {
       const redirectUrl = response.headers.get('Location');
       if (redirectUrl && redirectUrl.includes('amazonaws.com')) {
         console.log(`S3 redirect detected: ${redirectUrl}`);
-        const EMPTY_BODY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+        const EMPTY_BODY_SHA256 = getEmptyBodySHA256();
         const redirectHeaders = new Headers(request.headers);
         redirectHeaders.set('x-amz-content-sha256', EMPTY_BODY_SHA256);
         redirectHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
@@ -591,7 +633,7 @@ async function handleRequest(request, redirectCount = 0) {
           method: request.method,
           headers: redirectHeaders,
           body: request.body,
-          redirect: 'follow'
+          redirect: 'manual'
         });
         response = await fetch(redirectRequest);
         console.log(`S3 redirect response: ${response.status} ${response.statusText}`);
